@@ -7,7 +7,9 @@ M.config = {}
 M.mpv_job_id = nil
 M.ipc_pipe = nil
 M.ipc_connected = false
-M.ipc_socket_path = "/tmp/nvim-yt-player-ipc-" .. vim.fn.getpid()
+M.ipc_socket_path = "/tmp/nvim-yt-player-ipc.sock"
+M.client_registry_path = "/tmp/nvim-yt-player-clients.json"
+M.is_external_client = false
 
 M.shutting_down = false
 
@@ -17,9 +19,82 @@ local ipc_buffer = ""
 -- Pending commands to send once IPC is connected
 local pending_commands = {}
 
+-- Map request_id to property names so we can parse asynchronous get_property responses
+local request_id_counter = 0
+M.request_map = {}
+
+local function read_registry()
+  local f = io.open(M.client_registry_path, "r")
+  if not f then return {} end
+  local content = f:read("*a")
+  f:close()
+  if content == "" then return {} end
+  local ok, data = pcall(vim.json.decode, content)
+  if not ok or type(data) ~= "table" then return {} end
+  return data
+end
+
+local function write_registry(data)
+  local f = io.open(M.client_registry_path, "w")
+  if f then
+    f:write(vim.json.encode(data))
+    f:close()
+  end
+end
+
+local function cleanup_registry()
+  local clients = read_registry()
+  local active = {}
+  for _, pid in ipairs(clients) do
+    if uv.kill(pid, 0) == 0 then
+      table.insert(active, pid)
+    end
+  end
+  write_registry(active)
+  return active
+end
+
+local function register_client()
+  local active = cleanup_registry()
+  local my_pid = vim.fn.getpid()
+  local found = false
+  for _, pid in ipairs(active) do
+    if pid == my_pid then
+      found = true
+      break
+    end
+  end
+  if not found then
+    table.insert(active, my_pid)
+    write_registry(active)
+  end
+end
+
+local function unregister_client()
+  local clients = read_registry()
+  local active = {}
+  local my_pid = vim.fn.getpid()
+  for _, pid in ipairs(clients) do
+    if pid ~= my_pid and uv.kill(pid, 0) == 0 then
+      table.insert(active, pid)
+    end
+  end
+  write_registry(active)
+  return active
+end
+
 function M.setup(config)
   M.config = config
   M.shutting_down = false
+  M.is_external_client = false
+
+  -- Auto-connect if another instance is running
+  local active_clients = cleanup_registry()
+  if #active_clients > 0 and vim.fn.filereadable(M.ipc_socket_path) == 1 then
+    M.is_external_client = true
+    register_client()
+    M._connect_ipc_with_retry(0)
+  end
 end
 
 local function ensure_sponsorblock_script()
@@ -84,6 +159,8 @@ function M.start(url)
   if M.shutting_down then return false end
 
   if M.is_running() then
+    if url then M.load_url(url) end
+    register_client()
     return true
   end
 
@@ -107,6 +184,7 @@ function M.start(url)
     "--input-ipc-server=" .. M.ipc_socket_path,
   }
 
+  register_client()
   if M.config.sponsorblock then
     local script_path = ensure_sponsorblock_script()
     if script_path then
@@ -160,7 +238,7 @@ function M.start(url)
 end
 
 function M.is_running()
-  return M.mpv_job_id ~= nil
+  return M.mpv_job_id ~= nil or M.is_external_client
 end
 
 --- Try to connect to IPC socket with retries (mpv needs a moment to create it)
@@ -193,8 +271,8 @@ function M._connect_ipc_with_retry(attempt)
         else
           vim.schedule(function()
             if M.shutting_down then return end
-            vim.notify("YT Control: Failed to connect to mpv IPC after " .. max_attempts .. " attempts",
-              vim.log.levels.ERROR)
+            M._cleanup_ipc()
+            vim.fn.delete(M.ipc_socket_path)
           end)
         end
         return
@@ -219,6 +297,21 @@ function M._connect_ipc_with_retry(attempt)
         M.send_command({ "observe_property", 8, "playlist" })
         M.send_command({ "observe_property", 9, "playlist-pos" })
         M.send_command({ "observe_property", 10, "playlist-count" })
+
+        -- Fetch initial properties directly to populate the UI state immediately
+        local function fetch_prop(prop_name)
+          request_id_counter = request_id_counter + 1
+          M.request_map[request_id_counter] = prop_name
+          M.send_command({ "get_property", prop_name }, request_id_counter)
+        end
+
+        fetch_prop("pause")
+        fetch_prop("media-title")
+        fetch_prop("duration")
+        fetch_prop("volume")
+        fetch_prop("speed")
+        fetch_prop("playlist")
+        fetch_prop("playlist-pos")
 
         -- Flush any pending commands that were queued before IPC was ready
         M._flush_pending()
@@ -254,7 +347,11 @@ function M._flush_pending()
   local cmds = pending_commands
   pending_commands = {}
   for _, cmd in ipairs(cmds) do
-    M.send_command(cmd)
+    if type(cmd) == "table" and cmd.command_list then
+      M.send_command(cmd.command_list, cmd.request_id)
+    else
+      M.send_command(cmd)
+    end
   end
 end
 
@@ -277,52 +374,53 @@ function M._process_ipc_buffer()
   end
 end
 
+-- Property-to-state-key mapping table (avoids long if-else chain)
+local prop_map = {
+  ["time-pos"]       = { key = "position", default = 0 },
+  ["duration"]       = { key = "duration", default = 0 },
+  ["volume"]         = { key = "volume", default = 100 },
+  ["mute"]           = { key = "muted", default = false },
+  ["speed"]          = { key = "speed", default = 1 },
+  ["media-title"]    = { key = "title", default = "Unknown" },
+  ["playlist"]       = { key = "playlist", default = {} },
+  ["playlist-pos"]   = { key = "playlist_pos", default = 0 },
+  ["playlist-count"] = { key = "playlist_count", default = 0 },
+}
+
 function M._handle_ipc_message(line)
   if M.shutting_down then return end
 
   local ok, msg = pcall(vim.json.decode, line)
   if not ok then return end
 
-  -- Handle Property Changes
+  -- Resolve property name and data from observers or get_property responses
+  local prop_name, prop_data
+
   if msg.event == "property-change" then
-    local updates = {}
+    prop_name = msg.name
+    prop_data = msg.data
+  elseif msg.error == "success" and msg.data ~= nil and msg.request_id then
+    prop_name = M.request_map[msg.request_id]
+    if prop_name then
+      prop_data = msg.data
+      M.request_map[msg.request_id] = nil
+    end
+  end
 
-    if msg.name == "time-pos" then
-      updates.position = msg.data or 0
-    elseif msg.name == "duration" then
-      updates.duration = msg.data or 0
-    elseif msg.name == "pause" then
-      updates.playing = not msg.data
-    elseif msg.name == "volume" then
-      updates.volume = msg.data or 100
-    elseif msg.name == "mute" then
-      updates.muted = msg.data or false
-    elseif msg.name == "speed" then
-      updates.speed = msg.data or 1
-    elseif msg.name == "media-title" then
-      updates.title = msg.data or "Unknown"
-    elseif msg.name == "playlist" then
-      updates.playlist = msg.data or {}
-    elseif msg.name == "playlist-pos" then
-      updates.playlist_pos = msg.data or 0
-    elseif msg.name == "playlist-count" then
-      updates.playlist_count = msg.data or 0
+  if prop_name then
+    -- Special case: "pause" is inverted to "playing"
+    if prop_name == "pause" then
+      state_mod.update({ playing = not prop_data })
+      return
     end
 
-    -- Push to state
-    if not vim.tbl_isempty(updates) then
-      state_mod.update(updates)
+    local mapping = prop_map[prop_name]
+    if mapping then
+      state_mod.update({ [mapping.key] = prop_data or mapping.default })
     end
-
-    -- Handle events
   elseif msg.event == "end-file" then
-    -- Stream ended safely
     if msg.reason ~= "stop" and msg.reason ~= "quit" then
-      state_mod.update({
-        playing = false,
-        position = 0,
-        title = "Finished",
-      })
+      state_mod.update({ playing = false, position = 0, title = "Finished" })
     end
   end
 end
@@ -330,13 +428,14 @@ end
 --- Send a raw JSON IPC command to mpv
 --- If IPC isn't connected yet but mpv is running, queue the command.
 ---@param command_list table E.g. {"set_property", "pause", true}
-function M.send_command(command_list)
+---@param request_id number|nil
+function M.send_command(command_list, request_id)
   if M.shutting_down then return false end
 
   -- If IPC isn't ready yet but mpv is running, queue the command
   if not M.ipc_connected or not M.ipc_pipe then
     if M.is_running() then
-      table.insert(pending_commands, command_list)
+      table.insert(pending_commands, { command_list = command_list, request_id = request_id })
       return true -- queued
     end
     return false
@@ -346,7 +445,10 @@ function M.send_command(command_list)
     return false
   end
 
-  local ok, json = pcall(vim.json.encode, { command = command_list })
+  local payload = { command = command_list }
+  if request_id then payload.request_id = request_id end
+
+  local ok, json = pcall(vim.json.encode, payload)
   if not ok then return false end
 
   pcall(function()
@@ -387,19 +489,39 @@ function M._cleanup_ipc()
     M.ipc_pipe = nil
   end
   M.ipc_connected = false
+  M.is_external_client = false
   ipc_buffer = ""
 end
 
 function M.shutdown()
   M.shutting_down = true
-  M._cleanup_ipc()
 
-  if M.is_running() then
-    local id = M.mpv_job_id
-    M.mpv_job_id = nil
-    pcall(function()
-      vim.fn.jobstop(id)
-    end)
+  local remaining = unregister_client()
+  if #remaining == 0 then
+    -- Try sending quit directly to the pipe (bypassing send_command which blocks on shutting_down)
+    if M.ipc_connected and M.ipc_pipe and not M.ipc_pipe:is_closing() then
+      pcall(function()
+        M.ipc_pipe:write('{"command":["quit"]}\n')
+      end)
+    end
+    M._cleanup_ipc()
+
+    -- Synchronously kill mpv as a guaranteed fallback.
+    -- os.execute is synchronous and works reliably during VimLeave.
+    os.execute("pkill -f " .. vim.fn.shellescape(M.ipc_socket_path) .. " 2>/dev/null")
+
+    -- Clean up socket file
+    pcall(function() os.remove(M.ipc_socket_path) end)
+
+    if M.mpv_job_id ~= nil then
+      local id = M.mpv_job_id
+      M.mpv_job_id = nil
+      pcall(function()
+        vim.fn.jobstop(id)
+      end)
+    end
+  else
+    M._cleanup_ipc()
   end
 end
 
