@@ -167,7 +167,19 @@ function M._register()
       end,
       desc = "Queue an entire YouTube Playlist",
       nargs = 1
-    }
+    },
+    history = {
+      impl = function() require("yt-player.history").open_picker() end,
+      desc = "Browse play history",
+    },
+    history_clear = {
+      impl = function() require("yt-player.history").clear() end,
+      desc = "Clear play history",
+    },
+    radio = {
+      impl = function() require("yt-player.radio").toggle() end,
+      desc = "Toggle radio/autoplay mode",
+    },
   }
 
   vim.api.nvim_create_user_command("YT", function(opts)

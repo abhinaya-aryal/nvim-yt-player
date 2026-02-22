@@ -418,9 +418,28 @@ function M._handle_ipc_message(line)
     if mapping then
       state_mod.update({ [mapping.key] = prop_data or mapping.default })
     end
+
+    -- Record to play history when a new track starts
+    if prop_name == "media-title" and prop_data and prop_data ~= "" then
+      local current = state_mod.get_current()
+      pcall(function()
+        require("yt-player.history").add({
+          title = prop_data,
+          url = require("yt-player.radio").last_url or "",
+          duration = current.duration or 0,
+        })
+      end)
+    end
   elseif msg.event == "end-file" then
     if msg.reason ~= "stop" and msg.reason ~= "quit" then
       state_mod.update({ playing = false, position = 0, title = "Finished" })
+
+      -- Trigger radio autoplay if playlist is exhausted
+      local current = state_mod.get_current()
+      local at_end = (current.playlist_pos or 0) >= (#(current.playlist or {}) - 1)
+      if at_end then
+        pcall(function() require("yt-player.radio").on_queue_end() end)
+      end
     end
   end
 end
@@ -460,15 +479,15 @@ end
 
 --- High-level control function: Load URL
 function M.load_url(url)
+  -- Track URL for radio recommendations
+  pcall(function() require("yt-player.radio").last_url = url end)
+
   if not M.is_running() then
-    -- Start mpv with the URL directly on the command line — no IPC race!
     M.start(url)
   else
-    -- mpv is already running, use IPC to load the new file
     M.send_command({ "loadfile", url, "replace" })
   end
 
-  -- Optimistically set UI title while yt-dlp resolves the stream
   state_mod.update({
     title = "Loading...",
     playing = false,

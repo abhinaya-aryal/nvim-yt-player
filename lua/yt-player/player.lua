@@ -110,6 +110,15 @@ local function build_lines(state)
 
     local bottom_stats = string.format("  Vol %d%% [%s]     Spd %s", vol, volume_bar(vol, 10), speed_str)
     add_row(bottom_stats)
+
+    -- Radio mode indicator
+    local radio_on = pcall(function()
+        return require("yt-player.radio").enabled
+    end) and require("yt-player.radio").enabled
+    if radio_on then
+        add_center("📻 Radio Mode")
+    end
+
     table.insert(lines, " ╰──────────────────────────────────────────╯")
 
     -- Help Menu
@@ -117,7 +126,8 @@ local function build_lines(state)
     table.insert(lines, " │ [p/s/t] Play/Pause    [m] Mute           │")
     table.insert(lines, " │ [b/n] Prev/Next       [-/+] Volume       │")
     table.insert(lines, " │ [h/l] Seek ±5s        [</>] Speed        │")
-    table.insert(lines, " │ [H/L] Seek ±30s       [q] Close          │")
+    table.insert(lines, " │ [H/L] Seek ±30s       [r] Radio          │")
+    table.insert(lines, " │ [q] Close                                 │")
     table.insert(lines, " ╰──────────────────────────────────────────╯")
 
     -- Queue
@@ -215,6 +225,9 @@ local function setup_keymaps(buf, is_float)
     vim.keymap.set("n", "h", cmd({ "seek", -5, "relative" }), o)
     vim.keymap.set("n", "L", cmd({ "seek", 30, "relative" }), o)
     vim.keymap.set("n", "H", cmd({ "seek", -30, "relative" }), o)
+    vim.keymap.set("n", "r", function()
+        require("yt-player.radio").toggle(); refresh()
+    end, o)
 end
 
 ---------- PANEL ----------
